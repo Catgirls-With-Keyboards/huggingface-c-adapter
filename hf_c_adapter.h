@@ -14,7 +14,8 @@
 
 #define HF_LOCALHOST_ENDPOINT(port) "http://localhost:" port "/api/generate/"
 #define HF_REMOTE_ENDPOINT(id) "https://api-inference.huggingface.co/models/" id
-#define HF_REMOTE_ENDPOINT_ID_STARCODER "bigcode/starcoder"
+#define HF_REMOTE_ENDPOINT_ID_STARCODER_BASE "bigcode/starcoderbase"
+#define HF_REMOTE_ENDPOINT_ID_STARCODER_PYTHON "bigcode/starcoder"
 #define HF_DEFAULT_TEMP 0.2
 #define HF_DEFAULT_TOP_P 0.95
 #define HF_DEFAULT_TIMEOUT_MS 10000
@@ -76,6 +77,7 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
   const char *start_token = "<fim_prefix>";
   const char *middle_token = "<fim_middle>";
   const char *end_token = "<fim_suffix>";
+  const char *end_of_text_token = "<|endoftext|>";
   const char *auth_bearer = "Authorization: Bearer ";
 
   size_t num_results = 0;
@@ -213,10 +215,24 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
     if (num_results >= max_completions)
       _hf_cleanup();
 
-    char *valstr = strdup(generated_text->valuestring);
-    if (!valstr)
+    // Grab the string from the response
+    char *fullstr = strdup(generated_text->valuestring);
+    if (!fullstr)
       _hf_cleanup();
-    completions[num_results++] = valstr;
+
+    // Remove content before middle_token.
+    char *mid_loc = strstr(fullstr, middle_token);
+    if (!mid_loc)
+      _hf_cleanup();
+    mid_loc += strlen(middle_token);
+    memmove(fullstr, mid_loc, strlen(mid_loc) + 1);
+
+    // Remove end_token.
+    char *eot = strstr(fullstr, end_of_text_token);
+    if (eot)
+      *eot = '\0';
+
+    completions[num_results++] = fullstr;
   }
 
 cleanup:
