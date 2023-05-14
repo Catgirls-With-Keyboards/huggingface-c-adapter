@@ -12,12 +12,12 @@
 #include HF_CURL_H
 #endif
 
-// These are examples given by huggingface corporation.
-// curl -X POST http://localhost:8000/api/generate/ -d '{"inputs": "",
-//
-
-#define HF_LOCALHOST_ENDPOINT "http://localhost:8000/api/generate/"
-#define HF_API_ENDPOINT "https://api-inference.huggingface.co/models/"
+#define HF_LOCALHOST_ENDPOINT(port) "http://localhost:" port "/api/generate/"
+#define HF_REMOTE_ENDPOINT(id) "https://api-inference.huggingface.co/models/" id
+#define HF_REMOTE_ENDPOINT_ID_STARCODER "bigcode/starcoder"
+#define HF_DEFAULT_TEMP 0.2
+#define HF_DEFAULT_TOP_P 0.95
+#define HF_DEFAULT_TIMEOUT_MS 10000
 
 typedef struct {
   char *buf;
@@ -26,12 +26,13 @@ typedef struct {
 } _hf_strbuf;
 
 static inline void hf_strbuf_free(void *buf) { free(((_hf_strbuf *)buf)->buf); }
-
 static inline void cj_delete(void *item) { cJSON_Delete((cJSON *)item); }
+static inline void sl_free(void *sl) {
+  curl_slist_free_all((struct curl_slist *)sl);
+}
 
 static inline size_t hf_curl_write_callback(char *ptr, size_t size,
                                             size_t nmemb, void *userdata) {
-  printf("%p %zu %zu %p\n", ptr, size, nmemb, userdata);
   size_t realsize = size * nmemb;
   _hf_strbuf *buf = (_hf_strbuf *)userdata;
   if (buf->len + realsize > buf->cap) {
@@ -48,20 +49,15 @@ static inline size_t hf_curl_write_callback(char *ptr, size_t size,
 
 // Returns # of completions, which is 0 on failure.
 static inline size_t hf_complete(char *hf_api_key, char *endpoint,
-                                 char *content_before, char *content_after,
+                                 long timeout_ms, char *content_before,
+                                 char *content_after, double temperature,
+                                 double top_p, size_t max_new_tokens,
                                  size_t max_completions, char **completions) {
 
   if (!hf_api_key | !endpoint | !content_before | !content_after |
-      !max_completions | !completions)
+      !max_completions | !max_new_tokens | timeout_ms < 0 | !completions)
     return 0;
 
-  int num_results = 0;
-  size_t num_cleanup_entries = 0;
-  struct {
-    void *ptr;
-    void (*fp)(void *);
-  } cleanup_entries[64];
-  memset(cleanup_entries, 0, sizeof(cleanup_entries));
 #define _hf_cleanup() goto cleanup
 #define _hf_cleanup_push(f, p)                                                 \
   do {                                                                         \
@@ -69,33 +65,52 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
     cleanup_entries[num_cleanup_entries].fp = (f);                             \
     num_cleanup_entries++;                                                     \
   } while (0)
+  size_t num_cleanup_entries = 0;
+  struct {
+    void *ptr;
+    void (*fp)(void *);
+  } cleanup_entries[64];
+  memset(cleanup_entries, 0, sizeof(cleanup_entries));
 
-  const char *start_token = "{start token}";
-  const char *middle_token = "{middle token}";
-  const char *end_token = "{end token}";
-
+  // https://github.com/huggingface/huggingface-vscode/issues/33
+  const char *start_token = "<fim_prefix>";
+  const char *middle_token = "<fim_middle>";
+  const char *end_token = "<fim_suffix>";
   const char *auth_bearer = "Authorization: Bearer ";
+
+  size_t num_results = 0;
 
   CURL *curl;
   char *req_content_buf;
   struct curl_slist *headers = NULL;
-  cJSON *req_json = cJSON_CreateObject();
-  cJSON *req_parameters = cJSON_CreateObject();
+  cJSON *req_json;
+  cJSON *req_parameters;
   char *req_json_str;
   char *auth_header;
 
-  const size_t initial_cap = 4096 * 10;
-  _hf_strbuf response_strbuf = {NULL, 0, initial_cap};
-  cJSON *cj_error = NULL;
-  cJSON *response_json = NULL;
-  char *response_json_str = NULL;
+  const size_t initial_respbuf_cap = 4096 * 10;
+  _hf_strbuf response_strbuf = {NULL, 0, 0};
+  cJSON *cj_error;
+  cJSON *response_json_arr;
+  char *response_json_str;
 
   curl = curl_easy_init();
   if (!curl)
     _hf_cleanup();
   _hf_cleanup_push(curl_easy_cleanup, curl);
 
-  response_strbuf.buf = (char *)malloc(initial_cap);
+  req_json = cJSON_CreateObject();
+  if (!req_json)
+    _hf_cleanup();
+  _hf_cleanup_push(cj_delete, req_json);
+
+  req_parameters = cJSON_CreateObject();
+  if (!req_parameters)
+    _hf_cleanup();
+  // Will be cleaned up as part of previous cleanup push.
+
+  response_strbuf.buf = (char *)malloc(initial_respbuf_cap);
+  response_strbuf.cap = initial_respbuf_cap;
   if (!response_strbuf.buf)
     _hf_cleanup();
   _hf_cleanup_push(hf_strbuf_free, &response_strbuf);
@@ -108,14 +123,22 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
   _hf_cleanup_push(free, req_content_buf);
   strcpy(req_content_buf, start_token);
   strcat(req_content_buf, content_before);
-  strcat(req_content_buf, middle_token);
+  strcat(req_content_buf, end_token); // Intentional, lmao.
   strcat(req_content_buf, content_after);
-  strcat(req_content_buf, end_token);
+  strcat(req_content_buf, middle_token);
 
   if (!cJSON_AddStringToObject(req_json, "inputs", req_content_buf))
     _hf_cleanup();
+  if (!cJSON_AddNumberToObject(req_parameters, "max_completions",
+                               max_completions))
+    _hf_cleanup();
   if (!cJSON_AddNumberToObject(req_parameters, "max_new_tokens",
-                               max_completions)) _hf_cleanup();
+                               max_new_tokens))
+    _hf_cleanup();
+  if (!cJSON_AddNumberToObject(req_parameters, "temperature", temperature))
+    _hf_cleanup();
+  if (!cJSON_AddNumberToObject(req_parameters, "top_p", top_p))
+    _hf_cleanup();
   if (!cJSON_AddItemToObject(req_json, "parameters", req_parameters))
     _hf_cleanup();
 
@@ -123,6 +146,7 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
   if (!req_json_str)
     _hf_cleanup();
   _hf_cleanup_push(free, req_json_str);
+  puts(req_json_str);
 
   auth_header = (char *)malloc(strlen(auth_bearer) + strlen(hf_api_key) + 1);
   if (!auth_header)
@@ -138,10 +162,13 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
     _hf_cleanup();
   if (!(headers = curl_slist_append(headers, auth_header)))
     _hf_cleanup();
+  _hf_cleanup_push(sl_free, headers);
 
   if (curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers))
     _hf_cleanup();
   if (curl_easy_setopt(curl, CURLOPT_URL, endpoint))
+    _hf_cleanup();
+  if (curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms))
     _hf_cleanup();
   if (curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_json_str))
     _hf_cleanup();
@@ -149,25 +176,47 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
     _hf_cleanup();
   if (curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_strbuf))
     _hf_cleanup();
+
+  // Make request (blocking)
   if (curl_easy_perform(curl))
     _hf_cleanup();
 
-  // parse response json
-  response_json = cJSON_Parse(response_strbuf.buf);
-  if (!response_json)
+  response_json_arr = cJSON_Parse(response_strbuf.buf);
+  if (!response_json_arr)
     _hf_cleanup();
-  _hf_cleanup_push(cj_delete, response_json);
+  _hf_cleanup_push(cj_delete, response_json_arr);
 
-  response_json_str = cJSON_Print(response_json);
+  response_json_str = cJSON_Print(response_json_arr);
   if (!response_json_str)
     _hf_cleanup();
   _hf_cleanup_push(free, response_json_str);
   puts(response_json_str);
 
-  cj_error = cJSON_GetObjectItemCaseSensitive(response_json, "error");
-  if (cj_error) {
-    printf("Error: %s\n", cj_error->valuestring);
+  cj_error = cJSON_GetObjectItemCaseSensitive(response_json_arr, "error");
+  if (cj_error)
     _hf_cleanup();
+
+  // Get content
+  if (!cJSON_IsArray(response_json_arr))
+    _hf_cleanup();
+  for (size_t i = 0; i < cJSON_GetArraySize(response_json_arr); i++) {
+    // Get generated text for each completion
+    cJSON *item = cJSON_GetArrayItem(response_json_arr, i);
+    if (!item)
+      _hf_cleanup();
+    cJSON *generated_text =
+        cJSON_GetObjectItemCaseSensitive(item, "generated_text");
+    if (!generated_text || !cJSON_IsString(generated_text))
+      _hf_cleanup();
+
+    // Return generated from each completion
+    if (num_results >= max_completions)
+      _hf_cleanup();
+
+    char *valstr = strdup(generated_text->valuestring);
+    if (!valstr)
+      _hf_cleanup();
+    completions[num_results++] = valstr;
   }
 
 cleanup:

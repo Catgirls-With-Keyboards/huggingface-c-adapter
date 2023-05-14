@@ -24,19 +24,28 @@ static char *read_file(char *fname) {
   return content;
 }
 
+#define MAX_COMPLETIONS 5
+#define MAX_NEW_TOKENS 60
+
 int main(void) {
   // Read api key from file.
   char *api_key = read_file("test_api_key.txt");
-  char *endpoint = HF_API_ENDPOINT;
 
-  char *before = "Before_";
-  char *after = "_After";
+  char *endpoint = HF_REMOTE_ENDPOINT(HF_REMOTE_ENDPOINT_ID_STARCODER);
 
-  #define MAX_COMPLETIONS 5
+  char *before = "Double, double, toil and ";
+  char *after = ".\nFire burn and cauldron bubble.\n";
+
   char *completions[MAX_COMPLETIONS];
-  size_t num_completions = hf_complete(api_key, endpoint, before, after, MAX_COMPLETIONS, completions);
-  if (!num_completions) {
-    printf("Error in completion.\nErrno: %s\n", strerror(errno));
-    return 1;
+  size_t num_completions = hf_complete(
+      api_key, endpoint, HF_DEFAULT_TIMEOUT_MS, before, after, HF_DEFAULT_TEMP,
+      HF_DEFAULT_TOP_P, MAX_NEW_TOKENS, MAX_COMPLETIONS, completions);
+  free(api_key);
+
+  if (!num_completions)
+    return puts("Error in completion."), 1;
+  for (size_t i = 0; i < num_completions; i++) {
+    printf("Completion %zu: %s\n", i + 1, completions[i]);
+    free(completions[i]);
   }
 }
