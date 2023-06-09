@@ -120,6 +120,7 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
   req_content_buf = (char *)malloc(
       strlen(content_before) + strlen(content_after) + strlen(start_token) +
       strlen(end_token) + strlen(middle_token) + 1);
+
   if (!req_content_buf)
     _hf_cleanup();
   _hf_cleanup_push(free, req_content_buf);
@@ -221,11 +222,18 @@ static inline size_t hf_complete(char *hf_api_key, char *endpoint,
       _hf_cleanup();
 
     // Remove content before middle_token.
-    char *mid_loc = strstr(fullstr, middle_token);
-    if (!mid_loc)
-      _hf_cleanup();
-    mid_loc += strlen(middle_token);
-    memmove(fullstr, mid_loc, strlen(mid_loc) + 1);
+    {
+      char *i = req_content_buf;
+      char *j = fullstr;
+
+      // check fullstr starts with req_content_buf
+      for (; *i != '\0'; ++i, ++j) {
+        if (*i != *j)
+          _hf_cleanup();
+      } //* effect: j += strlen(req_content_buf);
+
+      memmove(fullstr, j, strlen(j) + 1);
+    }
 
     // Remove end_token.
     char *eot = strstr(fullstr, end_of_text_token);
